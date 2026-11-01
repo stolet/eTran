@@ -96,6 +96,7 @@ struct eTrantcp_connection {
     enum conn_status status;
 
     uint32_t pending_free_bytes;
+    uint32_t acked_bytes;
 
     std::list<std::pair<uint64_t, uint32_t> > unack_tx_addrs;
 
@@ -117,6 +118,8 @@ struct eTrantcp_connection {
         rxb_bump = 0;
         txb_head = 0;
         txb_sent = 0;
+        pending_free_bytes = 0;
+        acked_bytes = 0;
         txb_allocated = 0;
         local_ip = 0;
         remote_ip = 0;

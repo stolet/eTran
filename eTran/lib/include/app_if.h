@@ -12,6 +12,7 @@
 #include <base/mem_pool.h>
 
 #include <unordered_map>
+#include <mutex>
 #include <list>
 
 constexpr unsigned int MAX_APP_THREADS = 20;
@@ -185,6 +186,9 @@ struct app_ctx_per_thread {
 
 // application context in application
 struct app_ctx {
+    // Completion queues are shared by application workers.
+    std::mutex tcp_tx_frames_lock;
+    std::unordered_map<uint64_t, uint8_t> tcp_tx_frames;
     // the fd of Unix domain socket to communicate with the kernel
     int fd;
 

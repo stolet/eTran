@@ -81,6 +81,29 @@ static inline void lazy_update_prev_conn_rxev(struct eTrantcp_connection *cached
     cached_conn->rxb_used += cached_rx_bump;
 }
 
+enum TcpFrameState : uint8_t { TCP_FRAME_COMPLETED = 1, TCP_FRAME_ACKED = 2 };
+
+static void tcp_track_frame(struct app_ctx_per_thread *tctx, uint64_t addr, bool retransmission)
+{
+    std::lock_guard<std::mutex> lock(tctx->actx->tcp_tx_frames_lock);
+    tctx->actx->tcp_tx_frames.emplace(addr, retransmission ? TCP_FRAME_ACKED : 0);
+}
+
+// Completion queues are shared: either worker may observe the final release.
+static bool tcp_release_frame(struct app_ctx_per_thread *tctx, uint64_t addr, uint8_t state)
+{
+    std::lock_guard<std::mutex> lock(tctx->actx->tcp_tx_frames_lock);
+    auto frame = tctx->actx->tcp_tx_frames.find(addr);
+    if (frame == tctx->actx->tcp_tx_frames.end())
+        return false;
+    frame->second |= state;
+    if (frame->second == (TCP_FRAME_COMPLETED | TCP_FRAME_ACKED)) {
+        thread_bcache_prod(&tctx->iobuffer, addr);
+        tctx->actx->tcp_tx_frames.erase(frame);
+    }
+    return true;
+}
+
 static inline void in_order_receive(struct eTrantcp_connection *conn, uint64_t addr, char *pkt)
 {
     conn->rx_addrs.push_back({addr, pkt});
@@ -105,88 +128,43 @@ static inline void out_of_order_receive(struct eTrantcp_connection *conn, uint64
  */
 static inline bool sync_state(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, char *pkt, bool to)
 {
-    // bool can_continue_send = false;
     bool send_event = txb_bytes_avail(conn) == 0;
-    uint32_t xsk_budget_avail = rxmeta_xskbudget(pkt);
-    uint32_t ack_bytes = rxmeta_ackbytes(pkt);
-    uint32_t go_back_pos = rxmeta_go_back_pos(pkt);
-    uint32_t old_txb_sent = conn->txb_sent;
-    uint32_t go_back_bytes;
+    uint32_t budget = rxmeta_xskbudget(pkt);
+    uint32_t recovery_pos = rxmeta_go_back_pos(pkt);
+    bool recovery = recovery_pos != POISON_32 && (recovery_pos & RECOVERY_MASK);
+    // Recovery packets have no payload; rx_pos carries cumulative ACK credit.
+    uint32_t acked = recovery ? rxmeta_pos(pkt) : rxmeta_ackbytes(pkt);
 
-    if (to)
-    {
-        // printf("sync_state: xsk_budget_avail = %u, go_back_pos = %u(%d)\n",
-        //     xsk_budget_avail, (go_back_pos & ~RECOVERY_MASK), (go_back_pos & RECOVERY_MASK) == RECOVERY_MASK);
-    }
+    if (budget != POISON_32)
+        conn->xsk_budget = budget;
 
-    // Retransmission
-    // reset conn->txb_head and conn->txb_sent
-    if (unlikely(go_back_pos != POISON_32 && go_back_pos & RECOVERY_MASK))
+    if (acked != POISON_32)
     {
-        go_back_pos &= ~RECOVERY_MASK;
-        if (likely(go_back_pos != conn->txb_head))
+        // Credit is cumulative modulo 2^31, so repeats and lost reports are safe.
+        uint32_t delta = (acked - conn->acked_bytes) & ~RECOVERY_MASK;
+        if (delta && delta <= conn->txb_sent)
         {
-            if (conn->txb_head > go_back_pos)
-            {
-                go_back_bytes = conn->txb_head - go_back_pos;
-            }
-            else
-            {
-                go_back_bytes = conn->tx_buf_size - (go_back_pos - conn->txb_head);
-            }
-            conn->txb_head = go_back_pos;
-            conn->txb_allocated += go_back_bytes;
-            conn->txb_sent -= go_back_bytes;
-#ifdef DEBUG
-            printf("sync_state: go_back_bytes = %u\n", go_back_bytes);
-#endif
-            // enqueue to retransmission queue
-            // fprintf(stdout, "Reset pointer to %u for conn(%p)\n", go_back_pos, conn);
-            tctx->retransmission_conns.push_back(std::make_pair(conn, go_back_bytes));
+            conn->acked_bytes = acked;
+            conn->txb_sent -= delta;
+            if (!conn->pending_free_bytes)
+                tctx->free_pending_conns.push_back(conn);
+            conn->pending_free_bytes += delta;
         }
     }
 
-    // xsk budget update
-    if (xsk_budget_avail != POISON_32 && conn->xsk_budget != xsk_budget_avail)
+    if (recovery)
     {
-        conn->xsk_budget = xsk_budget_avail;
-#ifdef DEBUG
-        printf("sync_state: xsk_budget_avail = %u\n", xsk_budget_avail);
-#endif
-        // we can continue to send even if retransmission happens
-
-        // option1: as long as we have budget, we can continue to send
-        // can_continue_send = txb_bytes_avail(conn) > 0;
-
-        // option2: as long as we have at least some budget, we can continue to send
-        // this can help to reduce the number of events
-        // can_continue_send |= txb_bytes_avail(conn) >= (TCP_MSS_W_TS << 2);
+        recovery_pos &= ~RECOVERY_MASK;
+        uint32_t bytes = (conn->txb_head - recovery_pos) & ~RECOVERY_MASK;
+        // A delayed recovery may point behind data already acknowledged.
+        if (bytes && bytes <= conn->txb_sent)
+        {
+            conn->txb_head = recovery_pos;
+            conn->txb_allocated += bytes;
+            conn->txb_sent -= bytes;
+            tctx->retransmission_conns.push_back(std::make_pair(conn, bytes));
+        }
     }
-
-    if (unlikely(old_txb_sent != conn->txb_sent))
-    {
-        // retransmission happens, it's impossible to ack bytes
-        return send_event;
-    }
-
-    // ack bytes
-    if (ack_bytes != POISON_32 && ack_bytes)
-    {
-        conn->txb_sent -= ack_bytes;
-#ifdef DEBUG
-        printf("sync_state: ack_bytes = %u\n", ack_bytes);
-#endif
-        // option1: as long as we have budget, we can continue to send
-        // can_continue_send = txb_bytes_avail(conn) > 0;
-        // option2: as long as we have at least some budget, we can continue to send
-        // this can help to reduce the number of events
-        // can_continue_send |= txb_bytes_avail(conn) >= (TCP_MSS_W_TS << 2);
-
-        if (!conn->pending_free_bytes)
-            tctx->free_pending_conns.push_back(conn);
-        conn->pending_free_bytes += ack_bytes;
-    }
-
     return send_event;
 }
 
@@ -255,45 +233,38 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     // XDP has prepared the position in received buffer, payload offset and payload length for us
     py_len = rxmeta_plen(pkt);
     ooo_bump = rxmeta_ooo_bump(pkt);
+    if (ooo_bump != POISON_32 && (ooo_bump & OOO_CLEAR_MASK))
+    {
+        /* The current in-order payload supersedes the saved OOO interval. */
+        for (const auto &saved : conn->ooo_rx_addrs)
+            thread_bcache_prod(bc, saved.first);
+        conn->ooo_rx_addrs.clear();
+    }
+
     if (py_len == POISON_16)
     {
-        if (unlikely(ooo_bump & OOO_CLEAR_MASK)) {
-            /* clear out-of-order segments */
-            conn->ooo_rx_addrs.clear();
-        }
-
         thread_bcache_prod(bc, addr);
         goto out;
     }
 
-    if (ooo_bump != POISON_32)
+    if (ooo_bump != POISON_32 && (ooo_bump & OOO_FIN_MASK))
     {
-        /* An out-of-order interval is finished, this packet is the last acked part 
-            * (ooo_bump & ~OOO_FIN_MASK) equals to all acked bytes including this packet
-            */
-        if (ooo_bump & OOO_FIN_MASK)
-        {
-            ooo_bump &= ~OOO_FIN_MASK;
-            *cached_rx_bump += ooo_bump; // ooo_bump has already included py_len
-            /* append ooo_rx_addrs to the tail of rx_addrs */
-            conn->rx_addrs.insert(conn->rx_addrs.end(), conn->ooo_rx_addrs.begin(), conn->ooo_rx_addrs.end());
-            conn->ooo_rx_addrs.clear();
-            in_order_receive(conn, addr, pkt);
-            // printf("out_of_order_receive fin: rx_bump = %ld\n", *cached_rx_bump);
-        }
-        else if (ooo_bump & OOO_SEGMENT_MASK)
-        {
-            /* out-of-order segment, don't update cached_rx_bump */
-            out_of_order_receive(conn, addr, pkt);
-            // printf("out_of_order_receive: rx_bump = %ld\n", *cached_rx_bump);
-        }
+        ooo_bump &= ~OOO_FIN_MASK;
+        *cached_rx_bump += ooo_bump; // includes the current payload
+        conn->rx_addrs.insert(conn->rx_addrs.end(), conn->ooo_rx_addrs.begin(), conn->ooo_rx_addrs.end());
+        conn->ooo_rx_addrs.clear();
+        in_order_receive(conn, addr, pkt);
+    }
+    else if (ooo_bump != POISON_32 && (ooo_bump & OOO_SEGMENT_MASK))
+    {
+        /* Not readable until the missing prefix arrives. */
+        out_of_order_receive(conn, addr, pkt);
     }
     else
     {
-        /* This packet is in order */
+        /* OOO_CLEAR can accompany valid in-order data; retain that payload. */
         *cached_rx_bump += py_len;
         in_order_receive(conn, addr, pkt);
-        // printf("in_order_receive: rx_bump = %ld\n", *cached_rx_bump);
     }
 
 out:
@@ -340,6 +311,8 @@ int tcp_nic_poll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_eve
             rcvd = eTran_cq__peek(cq, std::min(tctx->txrx_xsk_info[qidx]->outstanding, TX_BATCH_SIZE), &idx_cq, tctx->actx->uring[qidx].comp_offset);
             for (unsigned int i = 0; i < rcvd; i++) {
                 uint64_t addr = *eTran_cq__comp_addr(cq, idx_cq + i, tctx->actx->uring[qidx].comp_offset);
+                if (tcp_release_frame(tctx, addr, TCP_FRAME_COMPLETED))
+                    continue;
                 if (unlikely(tcp_txmeta_get_from_slowpath(tctx->txrx_xsk_info[qidx]->umem_area, addr) || 
                     tcp_txmeta_get_flag(tctx->txrx_xsk_info[qidx]->umem_area, addr) == FLAG_SYNC)) {
                     thread_bcache_prod(bc, addr);
@@ -612,6 +585,8 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
             rcvd = eTran_cq__peek(cq, std::min(tctx->txrx_xsk_info[qidx]->outstanding, TX_BATCH_SIZE), &idx_cq, tctx->actx->uring[qidx].comp_offset);
             for (unsigned int i = 0; i < rcvd; i++) {
                 uint64_t addr = *eTran_cq__comp_addr(cq, idx_cq + i, tctx->actx->uring[qidx].comp_offset);
+                if (tcp_release_frame(tctx, addr, TCP_FRAME_COMPLETED))
+                    continue;
                 if (unlikely(tcp_txmeta_get_from_slowpath(tctx->txrx_xsk_info[qidx]->umem_area, addr) || 
                     tcp_txmeta_get_flag(tctx->txrx_xsk_info[qidx]->umem_area, addr) == FLAG_SYNC)) {
                     thread_bcache_prod(bc, addr);
@@ -759,7 +734,7 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
         uint32_t plen = it->second;
 
         skip_len += plen;
-        if (skip_len < conn->txb_sent) {
+        if (skip_len <= conn->txb_sent) {
             it++;
             continue;
         }
@@ -769,6 +744,12 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
             kick_tx(tctx->txrx_xsk_fd[qidx], tx);
         }
 
+        assert(thread_bcache_check(&tctx->iobuffer, 1) == 1);
+        uint64_t copy_addr = add_offset_tx_frame(thread_bcache_cons(&tctx->iobuffer));
+        size_t packet_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
+        memcpy(xsk_umem__get_data(umem_area, copy_addr), xsk_umem__get_data(umem_area, addr), packet_len);
+        addr = copy_addr;
+        tcp_track_frame(tctx, addr, true);
         tcp_txmeta_clear_all(umem_area, addr);
         tcp_txmeta_pos(umem_area, addr, conn->txb_head);
         tcp_txmeta_plen(umem_area, addr, plen);
@@ -781,11 +762,7 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
         desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
         desc->options = 0;
 
-        conn->txb_head += plen;
-        if (conn->txb_head >= conn->tx_buf_size)
-        {
-            conn->txb_head -= conn->tx_buf_size;
-        }
+        conn->txb_head = (conn->txb_head + plen) & ~RECOVERY_MASK;
 
         if (len > plen)
             len -= plen;
@@ -893,6 +870,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
             dma(pkt, (uint8_t *)buf + copy_offset, plen);
 
             conn->unack_tx_addrs.push_back({addr, plen});
+            tcp_track_frame(tctx, addr, false);
 
             desc->addr = addr;
             desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
@@ -902,11 +880,7 @@ void tcp_flow_tx_segmentation_zc(struct app_ctx_per_thread *tctx, struct eTrantc
 
             copy_offset += plen;
             
-            conn->txb_head += plen;
-            if (conn->txb_head >= conn->tx_buf_size)
-            {
-                conn->txb_head -= conn->tx_buf_size;
-            }
+            conn->txb_head = (conn->txb_head + plen) & ~RECOVERY_MASK;
         }
         xsk_ring_prod__submit(tx, batch_nr_buffers);
         total_submit_pkts += batch_nr_buffers;
@@ -1022,7 +996,6 @@ static inline void tcp_retransmission(struct app_ctx_per_thread *tctx)
 
 static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
 {
-    struct thread_bcache *bc = &tctx->iobuffer;
 
     while (!tctx->free_pending_conns.empty()) {
         auto it = tctx->free_pending_conns.begin();
@@ -1030,7 +1003,8 @@ static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
         while (conn->pending_free_bytes) {
             auto [addr, plen] = conn->unack_tx_addrs.front();
             conn->unack_tx_addrs.pop_front();
-            thread_bcache_prod(bc, addr);
+            bool tracked = tcp_release_frame(tctx, addr, TCP_FRAME_ACKED);
+            assert(tracked);
             conn->pending_free_bytes -= plen;
         }
         tctx->free_pending_conns.erase(it);
