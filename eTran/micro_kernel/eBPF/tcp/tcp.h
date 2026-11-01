@@ -227,7 +227,7 @@ static __always_inline __u32 xsk_budget_avail(const struct bpf_tcp_conn *c)
 static __always_inline __u32 tcp_txavail(const struct bpf_tcp_conn *c)
 {
     /* flow control window */
-    return c->rx_remote_avail - c->tx_sent;
+    return c->rx_remote_avail > c->tx_sent ? c->rx_remote_avail - c->tx_sent : 0;
 }
 
 static __always_inline void set_tcp_flag(struct tcphdr *tcph, __u16 len, __u16 flags)
@@ -285,7 +285,7 @@ static __always_inline void fill_tcp_hdr(struct iphdr *iph, struct tcphdr *tcph,
     ts_opt->ts_val = bpf_htonl(tgt_ts);
     ts_opt->ts_ecr = bpf_htonl(ts_ecr);
     
-    tcph->window = bpf_htons(rx_wnd) >> TCP_WND_SCALE;
+    tcph->window = bpf_htons(min(rx_wnd >> TCP_WND_SCALE, 0xFFFF));
     tcph->urg_ptr = 0;
 
     // Newer kernel has supported XDP_TXMD_FLAGS_CHECKSUM, ignore the overhead
@@ -316,21 +316,15 @@ static __always_inline __u64 cc_get_desired_tx_ts(struct bpf_cc *cc, __u64 ref_t
 static __always_inline __u32 fast_retransmit(struct bpf_tcp_conn *c, struct bpf_cc *cc)
 {
     __u32 go_back_bytes = c->tx_sent;
-    __u32 x;
 
     /* reset flow state as if we never transmitted those segments */
     c->rx_dupack_cnt = 0;
 
     c->tx_next_seq -= go_back_bytes;
-    if (c->tx_next_pos >= go_back_bytes) {
-        c->tx_next_pos -= go_back_bytes;
-    } else {
-        x = go_back_bytes - c->tx_next_pos;
-        c->tx_next_pos = c->tx_buf_size - x;
-    }
+    c->tx_next_pos = (c->tx_next_pos - go_back_bytes) & ~RECOVERY_MASK;
 
     c->tx_pending = 0;
-    c->rx_remote_avail += go_back_bytes;
+    /* The advertised window is measured from the cumulative ACK. */
 
     c->tx_sent = 0;
     cc->txp = 0;
@@ -375,16 +369,13 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 
     /* Timeout packet from slowpath, process it first */
     if (unlikely(data_meta->tx.flag & FLAG_TO)) {
-        if (!c->tx_sent) {
-            TCP_UNLOCK(c);
-            xdp_egress_log("Timeout but no data to retransmit");
-            return XDP_DROP;
-        }
-        data_meta->rx.go_back_pos = fast_retransmit(c, cc);
+        /* An idle refresh retries a recovery notification that userspace
+         * may have missed. Do not rewind the fast path a second time. */
+        data_meta->rx.go_back_pos = c->tx_sent ? fast_retransmit(c, cc) : c->tx_next_pos;
         // prepare to redirect to userspace
         data_meta->rx.qid = POISON_32;
         data_meta->rx.conn = c->opaque_connection;
-        data_meta->rx.rx_pos = POISON_32;
+        data_meta->rx.rx_pos = cc->cnt_rx_ack_bytes & ~RECOVERY_MASK;
         data_meta->rx.poff = POISON_16;
         data_meta->rx.plen = POISON_16;
         data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
@@ -448,9 +439,7 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     fill_ip_hdr(iph, payload_len, c->ecn_enable);
 
     c->tx_next_seq += payload_len;
-    c->tx_next_pos += payload_len;
-    if (c->tx_next_pos >= c->tx_buf_size)
-        c->tx_next_pos -= c->tx_buf_size;
+    c->tx_next_pos = (c->tx_next_pos + payload_len) & ~RECOVERY_MASK;
     c->tx_sent += payload_len;
     cc->txp = c->tx_sent > 0;
     c->tx_pending -= payload_len;
@@ -650,6 +639,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 {
     bool trigger_ack = false;
     __u32 go_back_pos = 0;
+    bool retransmit = false;
     __u32 payload_off = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
     __u32 payload_len = pkt_len - payload_off;
     __u32 seq = bpf_ntohl(tcph->seq);
@@ -662,6 +652,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     __u32 tx_bump = 0;
 
     bool clear_ooo = false;
+    bool ooo_accepted = false;
 
     __u32 now = 0;
     bool drop = true;
@@ -700,17 +691,25 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     }
 
     TCP_LOCK(c);
-    
+
+    /* A window reopening must reach the sender even during recovery, when
+     * an ACK may refer to bytes queued for retransmission. */
+    __u32 remote_window = (__u32)bpf_ntohs(tcph->window) << TCP_WND_SCALE;
+    bool window_reopened = remote_window > c->rx_remote_avail;
+    if (window_reopened)
+        c->rx_remote_avail = remote_window;
+
     /* ACK processing */
     if (tcph->ack == 1) {
         // update CC
         cc->cnt_rx_acks++;
         if (likely(tcp_valid_rxack(c, ack_seq, &tx_bump)) == 0) {
+            /* Window updates do not depend on accepting the ACK packet sequence. */
+            c->rx_remote_avail = remote_window;
             if (unlikely(tx_bump > c->tx_sent)) {
                 tx_bump = 0;
-                /* this is probably caused by retransmission */
-                trigger_ack = false;
-                goto unlock;
+                /* Validate payload independently of a stale ACK during recovery. */
+                goto validate_payload;
             }
             cc->cnt_rx_ack_bytes += tx_bump;
             if (unlikely(tcph->ece == 1))
@@ -730,24 +729,28 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
             * 4. There is no window update: c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)
             */
             /* duplicate ack ? */
-            else if (unlikely(c->tx_sent && payload_len == 0 && (c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3)) {
+            else if (unlikely(c->tx_sent && !window_reopened && payload_len == 0 && (c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3)) {
                 go_back_pos = fast_retransmit(c, cc);
+                retransmit = true; // ring position zero is a valid recovery target
                 xdp_log("Duplicate ACK triggers fast retransmission");
                 goto unlock;
             }
         } else {
-            trigger_ack = false;
+            /* Reject the ACK field, but ACK any duplicate payload. */
             xdp_log_err("Bad ack");
-            goto unlock;
+            tx_bump = 0;
+            goto validate_payload;
         }
     }
 
+validate_payload:;
     /* Payload validation */
     #ifdef OOO_RECV
     __u32 trim_start, trim_end;
     if (unlikely(tcp_valid_rxseq_ooo(c, seq, payload_len, &trim_start, &trim_end))) {
-        trigger_ack = false;
+        /* A duplicate payload still needs a cumulative ACK to recover a lost ACK. */
         xdp_log_err("Bad seq");
+        payload_len = 0;
         goto unlock;
     }
 
@@ -785,6 +788,8 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
         }
         // mark this packet is an out-of-order segment
         data_meta->rx.ooo_bump = OOO_SEGMENT_MASK;
+        /* Accepted OOO bytes must reach the library even if our TX budget is zero. */
+        ooo_accepted = payload_len != 0;
 
         goto unlock;
     }
@@ -792,8 +797,9 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
     #else
         __u32 trim_start, trim_end;
         if (unlikely(tcp_valid_rxseq(c, seq, payload_len, &trim_start, &trim_end))) {
-            trigger_ack = false;
+            /* A duplicate payload still needs a cumulative ACK. */
             xdp_log_err("Bad seq");
+            payload_len = 0;
             goto unlock;
         }
 
@@ -808,12 +814,6 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 
     #endif
 
-    if (likely(tx_bump || (c->rx_remote_avail < ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)))) {
-        /* update TCP receive window */
-        c->rx_remote_avail = (bpf_ntohs(tcph->window)) << TCP_WND_SCALE;
-        // bpf_printk("(%u),ack_seq(%u), c->rx_remote_avail(%u), c->tx_sent(%u)", tx_bump, ack_seq, c->rx_remote_avail, c->tx_sent);
-    }
-    
     /* update RTT estimate */
     if (payload_len && !c->tx_next_ts)
         c->tx_next_ts = ts_val;
@@ -848,7 +848,6 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
                 /* completely superfluous: drop out of order interval */
                 c->rx_ooo_len = 0;
                 data_meta->rx.ooo_bump = OOO_CLEAR_MASK;
-                trigger_ack = false;
                 clear_ooo = true;
             } else {
                 c->rx_ooo_start += trim_start;
@@ -884,21 +883,21 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 unlock:
 
     /* redirect this packet to userspace */
-    if (likely(rx_bump || tx_bump || go_back_pos || xsk_budget_avail(c)) || clear_ooo) {
+    if (likely(rx_bump || ooo_accepted || tx_bump || retransmit || xsk_budget_avail(c)) || clear_ooo) {
         drop = false;
         
         data_meta->rx.xsk_budget_avail = xsk_budget_avail(c);
         xdp_log("xsk_budget_avail(%u)", data_meta->rx.xsk_budget_avail);
-        if (tx_bump)
-            data_meta->rx.ack_bytes = tx_bump;
-        else if (unlikely(go_back_pos)) {
+        data_meta->rx.ack_bytes = cc->cnt_rx_ack_bytes & ~RECOVERY_MASK;
+        if (unlikely(retransmit)) {
             xdp_log("go_back_pos(%u)", go_back_pos);
             data_meta->rx.go_back_pos = go_back_pos;
             data_meta->rx.go_back_pos |= RECOVERY_MASK;
         }
 
         if (!payload_len) {
-            data_meta->rx.rx_pos = POISON_32;
+            data_meta->rx.rx_pos = retransmit ?
+                (cc->cnt_rx_ack_bytes & ~RECOVERY_MASK) : POISON_32;
             data_meta->rx.poff = POISON_16;
             data_meta->rx.plen = POISON_16;
             goto out;

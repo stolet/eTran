@@ -114,7 +114,7 @@ static int tcp_synack_pkt(struct tcp_connection *c, struct pkt_tcp *p, struct tc
 
 // This function is called when connection is not established
 static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p);
-static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt);
+static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt, const struct bpf_tcp_conn *probe_state = nullptr);
 
 static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen);
 static void unreg_tcp_conn_ebpf(struct tcp_connection *c);
@@ -347,7 +347,7 @@ static void send_tcp_reset(struct app_ctx *actx, const struct pkt_tcp *orig_p)
     return;
 }
 
-static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt)
+static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt, uint32_t ts_echo, uint16_t mss_opt, const struct bpf_tcp_conn *probe_state)
 {
     struct app_ctx *actx = c->tctx->actx;
     struct pkt_tcp *p;
@@ -361,6 +361,11 @@ static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt
     uint16_t local_port = c->local_port;
     uint32_t local_seq = c->local_seq;
     uint32_t remote_seq = c->remote_seq;
+    if (probe_state)
+    {
+        local_seq = probe_state->tx_next_seq - 1;
+        remote_seq = probe_state->rx_next_seq;
+    }
 
     uint8_t optlen;
     uint16_t len, off_ts, off_mss;
@@ -372,7 +377,7 @@ static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt
     off_ts = optlen;
     optlen += (ts_opt ? sizeof(*opt_ts) : 0);
     optlen = (optlen + 3) & ~3;
-    len = sizeof(*p) + optlen;
+    len = sizeof(*p) + optlen + (probe_state ? 1 : 0);
 
     p = (struct pkt_tcp *)calloc(1, len);
     if (!p)
@@ -400,7 +405,8 @@ static void send_tcp_control(struct tcp_connection *c, uint8_t flags, int ts_opt
     p->tcp.seqno = htonl(local_seq);
     p->tcp.ackno = htonl(remote_seq);
     TCPH_HDRLEN_FLAGS_SET(&p->tcp, 5 + optlen / 4, flags);
-    p->tcp.wnd = htons(11680); /* TODO */
+    p->tcp.wnd = htons(probe_state ?
+        std::min(probe_state->rx_avail >> TCP_WND_SCALE, (uint32_t)65535) : 11680);
     p->tcp.chksum = 0;
     p->tcp.urgp = htons(0);
 
@@ -945,6 +951,24 @@ static inline int issue_retransmit(struct tcp_connection *c)
     return 0;
 }
 
+/* A lost window update must not leave an otherwise idle sender paused forever.
+ * Probe with one already-ACKed byte; the peer discards it and returns its window. */
+static void issue_window_probe(struct tcp_connection *c)
+{
+    struct ebpf_flow_tuple key = {};
+    struct bpf_tcp_conn state = {};
+    key.local_ip = c->local_ip;
+    key.remote_ip = c->remote_ip;
+    key.local_port = c->local_port;
+    key.remote_port = c->remote_port;
+    if (bpf_map_lookup_elem(etran_tcp->_tcp_connection_map_fd, &key, &state))
+        return;
+    if (state.rx_remote_avail == 0)
+        send_tcp_control(c, TCP_ACK, 1, 0, 0, &state);
+    else if (state.tx_sent == 0)
+        issue_retransmit(c); // refresh a missed recovery, including stale tx_pending
+}
+
 static inline void handle_retransmission(struct tcp_connection *c, struct bpf_cc_snapshot *stats, uint64_t curr_tsc)
 {
     uint32_t cur_ts = cycles_to_us(curr_tsc);
@@ -963,6 +987,7 @@ static inline void handle_retransmission(struct tcp_connection *c, struct bpf_cc
 #ifdef DEBUG_TCP
 // printf("Timeout for connection (%p) to(%u)us, rtt(%u)us, send a dummpy packet to eBPF\n", c, (cur_ts - c->ts_tx_pending), rtt);
 #endif
+            issue_window_probe(c);
             if (issue_retransmit(c) == 0)
             {
                 c->cnt_tx_pending = 0;
@@ -973,6 +998,13 @@ static inline void handle_retransmission(struct tcp_connection *c, struct bpf_cc
     else
     {
         c->cnt_tx_pending = 0;
+        if (stats->c_ackb)
+            c->ts_tx_pending = cur_ts;
+        else if (!stats->txp && (cur_ts - c->ts_tx_pending) >= 100000)
+        {
+            c->ts_tx_pending = cur_ts;
+            issue_window_probe(c);
+        }
     }
 }
 
