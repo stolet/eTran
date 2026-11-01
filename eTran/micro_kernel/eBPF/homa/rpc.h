@@ -1390,6 +1390,7 @@ int client_response(struct data_header *d, __u32 remote_ip, struct homa_meta_inf
         {   /* all response packets have been received */
             rpc_slot->state = BPF_RPC_DEAD;
             RPC_UNLOCK(rpc_slot);
+            __sync_fetch_and_sub(&total_incoming, (__u64)seg_length);
             /* userspace will use this metadata to free buffers */
             data_meta->rx.reap_client_buffer_addr = rpc_slot->buffer_head;
 
