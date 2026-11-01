@@ -363,7 +363,11 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     ret = tcp_rx_process(tcph, c, pkt_len, data_meta, (iph->tos & IPTOS_ECN_CE) == IPTOS_ECN_CE, cpu);
     
-    if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
+    if (ret != XDP_REDIRECT) return XDP_DROP;
+    /* Keep the bounds check and array access on the same qid register.
+     * A stack reload after the check can lose its range in the verifier. */
+    asm volatile("" : "+r"(qid));
+    if (qid < MAX_NIC_QUEUES) {
         return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
     }
 
