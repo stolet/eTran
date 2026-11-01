@@ -1,12 +1,53 @@
 #include "nic.h"
 
+#include <dirent.h>
+#include <fstream>
 #include <ifaddrs.h>
+#include <sched.h>
 #include <string>
 #include <algorithm>
 
 #include <netinet/in.h>
 
 #include <utils/utils.h>
+
+/* mlx5 XDP transmission selects its queue by the current CPU number.
+ * Queue zero exists for every supported NIC configuration. */
+static int pin_pacer(void)
+{
+    DIR *tasks = opendir("/proc");
+    if (tasks == nullptr)
+    {
+        perror("open /proc for pacer affinity");
+        return -1;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(tasks)) != nullptr)
+    {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
+            continue;
+
+        std::ifstream comm(std::string("/proc/") + entry->d_name + "/comm");
+        std::string name;
+        if (!std::getline(comm, name) || name != "bpf_pacer")
+            continue;
+
+        pid_t pid = static_cast<pid_t>(strtol(entry->d_name, nullptr, 10));
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        CPU_SET(0, &cpus);
+        int ret = sched_setaffinity(pid, sizeof(cpus), &cpus);
+        if (ret != 0)
+            perror("set bpf_pacer affinity");
+        closedir(tasks);
+        return ret;
+    }
+
+    closedir(tasks);
+    fprintf(stderr, "Cannot find bpf_pacer; boot the eTran kernel first\n");
+    return -1;
+}
 
 static int enable_napi_polling(std::string if_name)
 {
@@ -152,6 +193,9 @@ int eTranNIC::create_nic(void)
         fprintf(stderr, "Failed to configure NIC queues\n");
         return -1;
     }
+
+    if (pin_pacer() != 0)
+        return -1;
 
     /* set the queue length */
     cmd = "ethtool -G " + _if_name + " rx " + std::to_string(_queue_len) + " tx " + std::to_string(_queue_len);
