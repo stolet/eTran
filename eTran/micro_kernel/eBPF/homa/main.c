@@ -138,6 +138,7 @@ int xdp_gen_prog(struct xdp_md *ctx)
     iph->tos = gi.priority << 5;
     iph->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct grant_header));
     iph->id = 0;
+    iph->frag_off = 0;
     iph->ttl = IPDEFTTL;
     iph->check = 0;
 
@@ -237,7 +238,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
     c = (struct common_header *)(iph + 1);
     d = (struct data_header *)c;
     
-    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
+    CHECK_AND_DROP_LOG(c + 1 > data_end, "c + 1 > data_end");
 
     CHECK_AND_DROP_LOG(iph->protocol != IPPROTO_HOMA, "not HOMA protocol");
 
@@ -246,6 +247,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
         return xmit_packet(ctx, eth, iph);
     }
     CHECK_AND_DROP_LOG(c->type != DATA, "not DATA packet");
+    CHECK_AND_DROP_LOG(d + 1 > data_end, "d + 1 > data_end");
     
     if (unlikely(d->retransmit)) {
         // TODO: we should throttle retransmitted packets
