@@ -67,7 +67,7 @@ static void disable_napi_polling(std::string if_name)
     std::string cmd2 = "echo 0 > /sys/class/net/" + if_name + "/napi_defer_hard_irqs";
     if (!exec_cmd(cmd1) || !exec_cmd(cmd2))
     {
-        fprintf(stderr, "Failed to enable napi polling\n");
+        fprintf(stderr, "Failed to disable napi polling\n");
         exit(EXIT_FAILURE);
     }
     printf("disable napi polling\n");
@@ -234,6 +234,11 @@ int eTranNIC::create_nic(void)
     {
         if (enable_napi_polling(_if_name))
             return -1;
+    }
+
+    else
+    {
+        disable_napi_polling(_if_name);
     }
 
     _local_ip = getIPAddress(_if_name);
