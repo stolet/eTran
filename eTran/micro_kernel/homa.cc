@@ -175,7 +175,11 @@ bool get_resend_range(struct rpc_state *rpc_state, struct resend_header *resend)
         return true;
     }
 
-    std::pair<int, int> hole = find_first_zero_segment(rpc_state->bitmap, rpc_state->bit_width);
+    /* Do not request data beyond the credit reserved for this RPC. */
+    __u32 granted_segments = rpc_state->cc.incoming / HOMA_MSS;
+    if (rpc_state->cc.incoming >= rpc_state->message_length)
+        granted_segments = rpc_state->bit_width;
+    std::pair<int, int> hole = find_first_zero_segment(rpc_state->bitmap, granted_segments);
 
     if (hole.first == -1 || hole.second == -1)
     {
@@ -185,7 +189,8 @@ bool get_resend_range(struct rpc_state *rpc_state, struct resend_header *resend)
     }
 
     resend->offset = hole.first * HOMA_MSS;
-    resend->length = (hole.second - hole.first + 1) * HOMA_MSS;
+    resend->length = std::min((__u32)((hole.second - hole.first + 1) * HOMA_MSS),
+        rpc_state->message_length - resend->offset);
     resend->priority = HOMA_MAX_PRIORITIES - 1;
 
     return true;
@@ -221,6 +226,9 @@ int xmit_need_ack_pkt(struct rpc_state *rpc_state)
     uint64_t buffer_addr = thread_bcache_cons(bc);
     buffer_addr = add_offset_tx_frame(buffer_addr);
     char *pkt = (char *)xsk_umem__get_data(xsk_info->umem_area, buffer_addr);
+
+    homa_txmeta_clear_all(xsk_info->umem_area, buffer_addr);
+    homa_txmeta_set_from_slowpath(xsk_info->umem_area, buffer_addr, 1);
 
     /* Fill IP header */
     struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
@@ -364,7 +372,6 @@ static void dump_retransmission(struct rpc_state *rpc_state, struct resend_heade
 
 static void check_timeout(struct hkey *hkey, struct rpc_state *rpc_state)
 {
-    struct rpc_state *shadow_rpc_state = &shadow_tbl[*hkey].data;
     __u32 *done_timer_ticks = &shadow_tbl[*hkey].done_timer_ticks;
     __u32 *silent_ticks = &shadow_tbl[*hkey].silent_ticks;
     __u32 *resend_try = &shadow_tbl[*hkey].resend_try;
@@ -386,8 +393,11 @@ static void check_timeout(struct hkey *hkey, struct rpc_state *rpc_state)
             if ((*done_timer_ticks + NEED_ACK_TICK - 1 - global_tick) & 1 << 31)
             {
                 /* send NEED_ACK packet for this RPC */
-                xmit_need_ack_pkt(rpc_state);
-                (*resend_try)++;
+                if (xmit_need_ack_pkt(rpc_state) == 0)
+                {
+                    *done_timer_ticks = global_tick;
+                    (*resend_try)++;
+                }
             }
         }
         return;
@@ -434,29 +444,6 @@ static void check_timeout(struct hkey *hkey, struct rpc_state *rpc_state)
         // reset timeout tick and clear resend_try
         *silent_ticks = 0;
         (*resend_try) = 0;
-        return;
-    }
-
-    /* If we detect the following events, reset timeout tick and clear resend_try:
-     * 1. receive DATA/GRANT/RESEND packets
-     * 2. send GRANT packets
-    */
-    if (rpc_state->cc.bytes_remaining != shadow_rpc_state->cc.bytes_remaining ||
-        rpc_state->cc.granted != shadow_rpc_state->cc.granted ||
-        rpc_state->cc.incoming != shadow_rpc_state->cc.incoming ||
-        rpc_state->resend_count != shadow_rpc_state->resend_count)
-    {
-        // printf("shadow_rpc_state->cc.bytes_remaining = %llu, rpc_state->cc.bytes_remaining = %llu\n",
-        // shadow_rpc_state->cc.bytes_remaining, rpc_state->cc.bytes_remaining); printf("shadow_rpc_state->cc.granted =
-        // %llu, rpc_state->cc.granted = %llu\n", shadow_rpc_state->cc.granted, rpc_state->cc.granted);
-        // printf("shadow_rpc_state->cc.incoming = %llu, rpc_state->cc.incoming = %llu\n",
-        // shadow_rpc_state->cc.incoming, rpc_state->cc.incoming);
-        *silent_ticks = 0;
-        (*resend_try) = 0;
-        shadow_rpc_state->cc.bytes_remaining = rpc_state->cc.bytes_remaining;
-        shadow_rpc_state->cc.granted = rpc_state->cc.granted;
-        shadow_rpc_state->cc.incoming = rpc_state->cc.incoming;
-        shadow_rpc_state->resend_count = rpc_state->resend_count;
         return;
     }
 
@@ -529,15 +516,22 @@ int poll_homa_to(void)
             {
                 /* case#2: not the first time meeting this RPC */
                 shadow_tbl[hkey].last_scan_tick = global_tick;
-                if (rpc_state.busy_count != shadow_tbl[hkey].data.busy_count)
+                struct rpc_state_wrapper &shadow = shadow_tbl[hkey];
+                if (rpc_state.busy_count != shadow.data.busy_count ||
+                    rpc_state.cc.bytes_remaining != shadow.data.cc.bytes_remaining ||
+                    rpc_state.cc.granted != shadow.data.cc.granted ||
+                    rpc_state.cc.incoming != shadow.data.cc.incoming ||
+                    rpc_state.resend_count != shadow.data.resend_count)
                 {
-                    /* eBPF received BUSY packet and modify busy_count, reset timeout tick */
-                    shadow_tbl[hkey].silent_ticks = 0;
-                    shadow_tbl[hkey].data.busy_count = rpc_state.busy_count;
-                    printf("Homa timer: Remote peer is busy, reset silent_ticks for RPC#%llu\n", rpc_state.id);
+                    /* Peer activity cancels consecutive unanswered probes. */
+                    shadow.silent_ticks = 0;
+                    shadow.resend_try = 0;
+                    shadow.done_timer_ticks = 0;
+                    shadow.data = rpc_state;
                 }
-                else {
-                    shadow_tbl[hkey].silent_ticks++;
+                else
+                {
+                    shadow.silent_ticks++;
                 }
 
                 if (shadow_tbl[hkey].resend_try == ABORT_RESEND) {
