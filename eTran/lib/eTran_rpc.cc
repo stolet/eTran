@@ -185,6 +185,7 @@ int RpcSocket::message_tx_retransmission(struct InternalResendMeta rm)
     }
 
     if (xsk_ring_prod__reserve(&xsk_info->tx, rm.nr_pkt, &idx_tx) < rm.nr_pkt) {
+        kick_tx(xsk_info->fd, &xsk_info->tx);
         LOG_ERR("Cannot reserve space in tx ring for retransmission.\n");
         return -1;
     }
@@ -192,7 +193,7 @@ int RpcSocket::message_tx_retransmission(struct InternalResendMeta rm)
     for (int i = 0; i < rm.nr_pkt; i++) {
         struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk_info->tx, idx_tx + i);
         tx_desc->addr = addr;
-        tx_desc->len = sizeof(struct ethhdr) + sizeof(struct iphdr) + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS);
+        tx_desc->len = HOMA_PAYLOAD_OFFSET + (i == rm.nr_pkt - 1 ? rm.len : HOMA_MSS);
         tx_desc->options = XDP_EGRESS_NO_COMP;
         addr = homa_txmeta_get_buffer_next(xsk_info->umem_area, addr);
     }
@@ -210,12 +211,14 @@ int RpcSocket::message_tx_retransmission(struct InternalResendMeta rm)
 
 void RpcSocket::flush_rpc_retransmission_queue(void)
 {
-    while (unlikely(!_retransmission_queue.empty()))
+    if (unlikely(!_retransmission_queue.empty()))
     {
         struct InternalResendMeta r = _retransmission_queue.front();
-        if (message_tx_retransmission(r) == 0) {
+
+        /* Retry on the next event-loop iteration if the TX ring is full. */
+        if (message_tx_retransmission(r) == 0)
+        {
             _retransmission_queue.pop();
-            break;
         }
     }
 }
@@ -251,6 +254,7 @@ void RpcSocket::prepare_retransmission(struct resend_header *r, uint64_t buffer_
             }
             new_buffer = thread_bcache_cons(&_tctx->iobuffer);
             new_buffer = add_offset_tx_frame(new_buffer);
+            homa_txmeta_clear_all(_tctx->txrx_xsk_info[0]->umem_area, new_buffer);
 
             // put new_buffer to the tail of the buffer chain
             if (buffer_tail != POISON_64)
@@ -260,16 +264,24 @@ void RpcSocket::prepare_retransmission(struct resend_header *r, uint64_t buffer_
 
             char *pkt = reinterpret_cast<char *>(xsk_umem__get_data(_tctx->txrx_xsk_info[0]->umem_area, new_buffer));
             char *old_pkt = reinterpret_cast<char *>(xsk_umem__get_data(_tctx->txrx_xsk_info[0]->umem_area, buffer_addr));
-            memcpy(pkt, old_pkt, std::min((uint32_t)HOMA_MSS, length));
+            const struct data_header *original = reinterpret_cast<const struct data_header *>(
+                old_pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+            uint32_t payload_len = __be32_to_cpu(original->seg.segment_length);
+
+            /* Resend complete segments, including all protocol headers. */
+            memcpy(pkt, old_pkt, HOMA_PAYLOAD_OFFSET + payload_len);
             struct iphdr *iph = reinterpret_cast<struct iphdr *>(pkt + sizeof(struct ethhdr));
             iph->tos = priority << 5;
             struct data_header *d = reinterpret_cast<struct data_header *>(pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-            d->retransmit = 1;            
+            d->retransmit = r->common.type == UNKNOWN ? 0 : 1;
+            if (r->common.type == UNKNOWN)
+                homa_txmeta_set_from_slowpath(_tctx->txrx_xsk_info[0]->umem_area,
+                    new_buffer, 1);
             if (first) {
                 rm.addr = new_buffer;
                 first = false;
             }
-            rm.len = std::min((uint32_t)HOMA_MSS, length);
+            rm.len = payload_len;
             rm.nr_pkt++;
 
             if (length > HOMA_MSS)
@@ -302,6 +314,8 @@ void RpcSocket::poll_nic_rx(void)
     for (qidx = 0; qidx < nr_nic_queues; qidx++) {
         xsk_info = XSK_INFO(qidx);
         rx = &xsk_info->rx;
+        kick_fq(_tctx->txrx_xsk_fd[qidx], FQ(qidx),
+            _tctx->actx->uring[qidx].fill_offset);
         if (!xsk_rxring_empty(rx)) {
             active_qidx[nfds++] = qidx;
         }
@@ -346,7 +360,7 @@ void RpcSocket::poll_nic_rx(void)
 
             /* filter non-DATA packets */
             if (unlikely(type != DATA)) {
-                if (unlikely(type == RESEND)) {
+                if (unlikely(type == RESEND || type == UNKNOWN)) {
                     if (reap_client_buffer_addr != POISON_64)
                         enqueue_reap_backlog(reap_client_buffer_addr);
                     if (reap_server_buffer_addr != POISON_64) {
@@ -414,6 +428,7 @@ void RpcSocket::poll_nic_rx(void)
         eTran_fq__submit(fq, need_fill, fill_offset);
         
         FQ_UNLOCK(qidx);
+        kick_fq(_tctx->txrx_xsk_fd[qidx], fq, fill_offset);
         _tctx->txrx_xsk_info[qidx]->cached_needfill -= j;
         
         if (unlikely(_tctx->txrx_xsk_info[qidx]->cached_needfill)) {
@@ -443,6 +458,11 @@ void RpcSocket::poll_nic_rx_block(int timeout)
                     _request_queue.size() == 0 &&
                     _response_queue.size() == 0 && 
                     _reap_backlog.size() == 0) ? timeout : 0;
+    for (qidx = 0; qidx < nr_nic_queues; qidx++)
+    {
+        kick_fq(_tctx->txrx_xsk_fd[qidx], FQ(qidx),
+            _tctx->actx->uring[qidx].fill_offset);
+    }
     nfds = epoll_wait(_tctx->epfd, events, nr_nic_queues, timeout);
     if (nfds <= 0)
         return;
@@ -486,7 +506,7 @@ void RpcSocket::poll_nic_rx_block(int timeout)
 
             /* filter non-DATA packets */
             if (unlikely(type != DATA)) {
-                if (unlikely(type == RESEND)) {
+                if (unlikely(type == RESEND || type == UNKNOWN)) {
                     if (reap_client_buffer_addr != POISON_64)
                         enqueue_reap_backlog(reap_client_buffer_addr);
                     if (reap_server_buffer_addr != POISON_64)
@@ -549,6 +569,7 @@ void RpcSocket::poll_nic_rx_block(int timeout)
         eTran_fq__submit(fq, need_fill, fill_offset);
         
         FQ_UNLOCK(qidx);
+        kick_fq(_tctx->txrx_xsk_fd[qidx], fq, fill_offset);
         _tctx->txrx_xsk_info[qidx]->cached_needfill -= j;
         
         if (unlikely(_tctx->txrx_xsk_info[qidx]->cached_needfill)) {
