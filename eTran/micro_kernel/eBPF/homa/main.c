@@ -186,6 +186,8 @@ reset:
         return XDP_GEN_RETURN_DROP(last_grant);
     }
 
+    record_grant(&gi);
+
     // flush the FIFO queue
     if (send_fifo_rpc)
         need_grant_fifo[cpu] = 0;
@@ -429,6 +431,19 @@ ctrl_pkt:
             CHECK_AND_DROP(homa_parse_unknown_hdr(&nh, data_end, &homa_unknown_hdr) != 0);
             ret = unknown_pkt(ctx, homa_unknown_hdr, data_meta, data_end, remote_ip);
             goto drop;
+        case NEED_ACK:
+        {
+            struct rpc_key_t key = {
+                .rpcid = local_id(bpf_be64_to_cpu(homa_common_hdr->sender_id)),
+                .local_port = local_port,
+                .remote_port = bpf_ntohs(homa_common_hdr->sport),
+                .remote_ip = remote_ip,
+            };
+            struct rpc_state *rpc = bpf_map_lookup_elem(&rpc_tbl, &key);
+
+            /* Keep the response while its client still has an active RPC. */
+            return xmit_ctrl_pkt(ctx, rpc && rpc->state != BPF_RPC_DEAD ? BUSY : UNKNOWN);
+        }
         case GRANT:
             CHECK_AND_DROP(homa_parse_grant_hdr(&nh, data_end, &homa_grant_hdr) != 0);
             grant_pkt(homa_grant_hdr, remote_ip);
@@ -727,10 +742,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -783,10 +800,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -839,10 +858,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -895,10 +916,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -951,10 +974,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -1007,10 +1032,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -1063,10 +1090,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;
@@ -1119,10 +1148,12 @@ int choose_rpc_to_grant_prog(struct xdp_md *ctx)
         new_grant = n->message_length - n->bytes_remaining + Homa_grant_window;
         if (new_grant > n->message_length)
             new_grant = n->message_length;
-        available = Homa_max_incoming - total_incoming;
-        increment = new_grant - n->incoming;
-        if (increment > 0 && available > 0)
+        available = Homa_max_incoming - total_incoming - total_increment;
+        increment = new_grant > n->incoming ? new_grant - n->incoming : 0;
+        if ((increment > 0 && available > 0) || n->incoming >= n->message_length)
         {
+            if (n->incoming >= n->message_length)
+                new_grant = n->incoming;
             if (increment > available)
             {
                 increment = available;

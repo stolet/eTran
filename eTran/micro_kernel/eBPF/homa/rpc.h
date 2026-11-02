@@ -748,6 +748,8 @@ int grant_fifo_rpc(struct ret_grant_info *gi)
 {
     struct rpc_state_cc __kptr *cc_node_search = NULL;
     struct bpf_rb_node *rb_node = NULL;
+    struct rpc_state_cc *peer_node = NULL;
+    struct rpc_state_cc *peer_search = NULL;
     __u64 increment = 0, newgrant = 0;
     bool need_remove = false;
 
@@ -755,6 +757,12 @@ int grant_fifo_rpc(struct ret_grant_info *gi)
     if (unlikely(!cc_node_search))
         return -1;
 
+    peer_search = bpf_obj_new(typeof(*peer_search));
+    if (!peer_search)
+    {
+        bpf_obj_drop(cc_node_search);
+        return -1;
+    }
     cc_node_search->birth = POISON_64;
 
     GRANT_LOCK();
@@ -762,9 +770,27 @@ int grant_fifo_rpc(struct ret_grant_info *gi)
     rb_node = bpf_rbtree_search_less(&groot, &cc_node_search->rbtree_link, less_birth_grant);
     if (unlikely(!rb_node)) {
         GRANT_UNLOCK();
+        bpf_obj_drop(peer_search);
         return 1;
     }
     cc_node_search = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+
+    /* FIFO selects Tree0; priority grants update the matching Tree1 node. */
+    peer_search->tree_id = 1;
+    peer_search->bytes_remaining = cc_node_search->bytes_remaining;
+    peer_search->peer_id = cc_node_search->peer_id;
+    rb_node = bpf_rbtree_lower_bound(&groot, &peer_search->rbtree_link, srpt_less_peer);
+    peer_search = NULL;
+    if (rb_node)
+    {
+        peer_node = container_of(rb_node, struct rpc_state_cc, rbtree_link);
+        if (peer_node->tree_id != 1 ||
+            __builtin_memcmp(&peer_node->hkey, &cc_node_search->hkey,
+                sizeof(struct rpc_key_t)) != 0)
+            peer_node = NULL;
+    }
+    if (peer_node && peer_node->incoming > cc_node_search->incoming)
+        cc_node_search->incoming = peer_node->incoming;
 
     increment = GRANT_FIFO_INCREMENT;
     newgrant = increment + cc_node_search->incoming;
@@ -775,6 +801,8 @@ int grant_fifo_rpc(struct ret_grant_info *gi)
         need_remove = true;
     }
 
+    if (peer_node)
+        peer_node->incoming = cc_node_search->incoming;
     __sync_fetch_and_add(&total_incoming, increment);
 
     gi->rpcid = cc_node_search->hkey.rpcid;
@@ -784,7 +812,8 @@ int grant_fifo_rpc(struct ret_grant_info *gi)
     gi->newgrant = cc_node_search->incoming;
     gi->priority = HOMA_MAX_SCHED_PRIO;
 
-    if (need_remove) {
+    /* Priority selection removes both copies when Tree1 is present. */
+    if (need_remove && !peer_node) {
         rb_node = bpf_rbtree_remove(&groot, &cc_node_search->rbtree_link);
         if (rb_node)
             cc_node_search = container_of(rb_node, struct rpc_state_cc, rbtree_link);
@@ -1588,7 +1617,8 @@ int xmit_ctrl_pkt(struct xdp_md *ctx, enum homa_packet_type type)
     __u32 ip_swap;
     __u8 mac_swap[ETH_ALEN];
 
-    int length = (int)sizeof(struct common_header) - (int)sizeof(struct resend_header); // < 0
+    int length = sizeof(struct ethhdr) + sizeof(struct iphdr) +
+        sizeof(struct common_header) - (ctx->data_end - ctx->data);
 
     if (bpf_xdp_adjust_tail(ctx, length))
     {
@@ -1608,6 +1638,11 @@ int xmit_ctrl_pkt(struct xdp_md *ctx, enum homa_packet_type type)
     if (homa_common_h + 1 > data_end)
         return XDP_DROP;
 
+    iph->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct common_header));
+    iph->check = 0;
+    __u64 csum = 0;
+    ipv4_csum_inline(iph, &csum);
+    iph->check = csum;
     homa_common_h->type = type;
 
     homa_common_h->sender_id = bpf_cpu_to_be64(local_id(bpf_be64_to_cpu(homa_common_h->sender_id)));
@@ -1627,6 +1662,28 @@ int xmit_ctrl_pkt(struct xdp_md *ctx, enum homa_packet_type type)
     return XDP_TX;
 }
 
+static __always_inline void grant_pkt(struct grant_header *homa_grant_h,
+    __u32 remote_ip);
+
+/* Keep timeout recovery aware of credit issued before DATA echoes it back. */
+static __always_inline void record_grant(struct ret_grant_info *gi)
+{
+    struct rpc_key_t key = {
+        .rpcid = gi->rpcid,
+        .local_port = gi->sport,
+        .remote_port = gi->dport,
+        .remote_ip = gi->remote_ip,
+    };
+    struct rpc_state *rpc = bpf_map_lookup_elem(&rpc_tbl, &key);
+
+    if (!rpc)
+        return;
+    RPC_LOCK(rpc);
+    if (rpc->state == BPF_RPC_INCOMING && gi->newgrant > rpc->cc.incoming)
+        rpc->cc.incoming = gi->newgrant;
+    RPC_UNLOCK(rpc);
+}
+
 static __always_inline
 int resend_pkt(struct resend_header *homa_resend_h, struct homa_meta_info *data_meta, __u32 remote_ip)
 {
@@ -1634,6 +1691,7 @@ int resend_pkt(struct resend_header *homa_resend_h, struct homa_meta_info *data_
     struct rpc_state *rpc_slot = NULL;
     int ret = RESEND;
     bool need_kick = false;
+    __u32 resend_end = 0;
 
     __u64 rpcid = bpf_be64_to_cpu(homa_resend_h->common.sender_id);
     rpcid = local_id(rpcid);
@@ -1678,6 +1736,17 @@ int resend_pkt(struct resend_header *homa_resend_h, struct homa_meta_info *data_
         goto out;
     }
 
+    /* A RESEND authorizes its byte range even if the GRANT was lost. */
+    if (rpc_slot->state == BPF_RPC_OUTGOING && homa_resend_h->length != 0)
+    {
+        __u64 end = (__u64)bpf_ntohl(homa_resend_h->offset) +
+            bpf_ntohl(homa_resend_h->length);
+        if (end > rpc_slot->message_length)
+            end = rpc_slot->message_length;
+        if (end > rpc_slot->cc.granted)
+            resend_end = end;
+    }
+
     // if (rpc_slot->next_xmit_offset < rpc_slot->cc.granted) {
     if (bpf_ntohl(homa_resend_h->offset) >= rpc_slot->next_xmit_offset) {
         /* We have chosen not to transmit data from this message;
@@ -1706,6 +1775,15 @@ out:
     }
 
     RPC_UNLOCK(rpc_slot);
+
+    if (resend_end)
+    {
+        struct grant_header grant = {0};
+        grant.common = homa_resend_h->common;
+        grant.offset = bpf_htonl(resend_end);
+        grant.priority = homa_resend_h->priority;
+        grant_pkt(&grant, remote_ip);
+    }
 
     if (need_kick) {
         kick_pacer();
@@ -1774,9 +1852,12 @@ int unknown_pkt(struct xdp_md *ctx, struct unknown_header *homa_unknown_h,
             if (homa_resend_h + 1 > data_end) {
                 return -1;
             }
-            homa_resend_h->common.type = RESEND;
+            /* Preserve UNKNOWN locally so userspace restarts the request,
+             * instead of sending retransmissions that cannot create server state. */
+            homa_resend_h->common.type = UNKNOWN;
             homa_resend_h->offset = 0;
             homa_resend_h->length = bpf_htonl(next_xmit_offset);
+            homa_resend_h->priority = HOMA_MAX_PRIORITY - 1;
             return 0;
         }
     }
