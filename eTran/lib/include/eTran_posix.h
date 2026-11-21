@@ -114,7 +114,7 @@ static inline int eTran_tcp_tx_submit_zc_retransmission(struct app_ctx_per_threa
     conn->txb_allocated -= len;
     conn->txb_sent += len;
 
-    return 0;
+    return len;
 }
 
 static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx, struct eTrantcp_connection *conn, size_t count, void *buf)
@@ -148,7 +148,7 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
                     /* truncate packet */
                     rxmeta_set_poff(pkt, py_off + append_len);
                     rxmeta_set_plen(pkt, py_len - append_len);
-                    rxmeta_set_pos(pkt, rx_pos + append_len > conn->rx_buf_size ? rx_pos + append_len - conn->rx_buf_size : rx_pos + append_len);
+                    rxmeta_set_pos(pkt, rx_pos + append_len >= conn->rx_buf_size ? rx_pos + append_len - conn->rx_buf_size : rx_pos + append_len);
                     // printf("truncate packet: copy_offset(%u), append_len(%ld)\n", copy_offset, append_len);
                     break;
                 }
@@ -181,7 +181,7 @@ static inline ssize_t eTran_tcp_rx_peek_count_zc(struct app_ctx_per_thread *tctx
                     /* truncate packet */
                     rxmeta_set_poff(pkt, py_off + append_len);
                     rxmeta_set_plen(pkt, py_len - append_len);
-                    rxmeta_set_pos(pkt, rx_pos + append_len > conn->rx_buf_size ? rx_pos + append_len - conn->rx_buf_size : rx_pos + append_len);
+                    rxmeta_set_pos(pkt, rx_pos + append_len >= conn->rx_buf_size ? rx_pos + append_len - conn->rx_buf_size : rx_pos + append_len);
                     // printf("truncate packet: copy_offset(%u), append_len(%ld)\n", copy_offset, append_len);
                     break;
                 }
@@ -258,6 +258,11 @@ static inline ssize_t eTran_tcp_tx_reserve_zc(struct app_ctx_per_thread *tctx, s
         fprintf(stderr, "eTran_tcp_tx_reserve_zc(): conn->status != CONN_OPEN\n");
         return -EINVAL;
     }
+
+    /* A partial retransmission owns the bytes at the rewound TX head.
+     * Do not insert new data before that queued suffix is published. */
+    if (conn->txb_allocated)
+        return 0;
 
     avail = txb_bytes_avail(conn);
     if (avail < reserve_len)

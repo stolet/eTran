@@ -58,8 +58,8 @@ static __always_inline __u32 tw_insert(__u32 cpu, __u64 ts)
     // convert timestamp to bucket index(abosulte value)
     ts = ts / SLOT_WIDTH_NS;
 
-    // initialize front_timestamp
-    if (unlikely(front_timestamp[cpu] == 0)) {
+    // Rebase only an empty wheel; queued packets retain their bucket times.
+    if (unlikely(nr_pkts_in_tw[cpu] == 0)) {
         front_timestamp[cpu] = bpf_ktime_get_ns() / SLOT_WIDTH_NS;
     }
     

@@ -251,9 +251,36 @@ static inline void handle_rx(struct app_ctx_per_thread *tctx, struct eTrantcp_co
     {
         ooo_bump &= ~OOO_FIN_MASK;
         *cached_rx_bump += ooo_bump; // includes the current payload
-        conn->rx_addrs.insert(conn->rx_addrs.end(), conn->ooo_rx_addrs.begin(), conn->ooo_rx_addrs.end());
-        conn->ooo_rx_addrs.clear();
         in_order_receive(conn, addr, pkt);
+        /* The gap-filling packet precedes the saved interval.  Retransmission
+         * may also overlap its prefix; only promote bytes beyond this packet. */
+        uint32_t start = (rxmeta_pos(pkt) + py_len) % conn->rx_buf_size;
+        uint32_t promoted = ooo_bump - py_len;
+        for (auto it = conn->ooo_rx_addrs.begin(); it != conn->ooo_rx_addrs.end();) {
+            char *saved = it->second;
+            uint32_t pos = rxmeta_pos(saved);
+            uint32_t len = rxmeta_plen(saved);
+            uint32_t skip = (start + conn->rx_buf_size - pos) % conn->rx_buf_size;
+            if (skip < len) {
+                rxmeta_set_poff(saved, rxmeta_poff(saved) + skip);
+                rxmeta_set_plen(saved, len - skip);
+                rxmeta_set_pos(saved, start);
+                pos = start;
+            }
+            uint32_t distance = (pos + conn->rx_buf_size - start) % conn->rx_buf_size;
+            if (distance >= promoted) {
+                thread_bcache_prod(bc, it->first);
+                it = conn->ooo_rx_addrs.erase(it);
+            } else {
+                rxmeta_set_plen(saved, std::min<uint32_t>(rxmeta_plen(saved), promoted - distance));
+                ++it;
+            }
+        }
+        conn->ooo_rx_addrs.sort([start, conn](const auto &a, const auto &b) {
+            return (rxmeta_pos(a.second) + conn->rx_buf_size - start) % conn->rx_buf_size <
+                   (rxmeta_pos(b.second) + conn->rx_buf_size - start) % conn->rx_buf_size;
+        });
+        conn->rx_addrs.splice(conn->rx_addrs.end(), conn->ooo_rx_addrs);
     }
     else if (ooo_bump != POISON_32 && (ooo_bump & OOO_SEGMENT_MASK))
     {
@@ -722,32 +749,36 @@ size_t tcp_flow_tx_segmentation_zc_retransmission(struct app_ctx_per_thread *tct
     auto it = conn->unack_tx_addrs.begin();
     uint64_t first_pkt_addr = POISON_64;
 
-    uint32_t skip_len = 0;
+    uint32_t skip_len = conn->acked_frame_offset + conn->txb_sent;
     
     while (len)
     {
-        if (total_submit_pkts)
-            it++;
         if (it == conn->unack_tx_addrs.end())
             break;
         uint64_t addr = it->first;
         uint32_t plen = it->second;
 
-        skip_len += plen;
-        if (skip_len <= conn->txb_sent) {
-            it++;
+        it++;
+        if (skip_len >= plen) {
+            skip_len -= plen;
             continue;
         }
+        uint32_t offset = skip_len;
+        skip_len = 0;
+        plen = std::min<size_t>(plen - offset, len);
 
-        while (xsk_ring_prod__reserve(tx, 1, &idx_tx) < 1)
-        {
-            kick_tx(tctx->txrx_xsk_fd[qidx], tx);
-        }
+        /* Publish this batch before waiting for more ring space.  Reserved
+         * descriptors are invisible to the kernel until submit below. */
+        if (xsk_ring_prod__reserve(tx, 1, &idx_tx) < 1)
+            break;
 
         assert(thread_bcache_check(&tctx->iobuffer, 1) == 1);
         uint64_t copy_addr = add_offset_tx_frame(thread_bcache_cons(&tctx->iobuffer));
-        size_t packet_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE + plen;
-        memcpy(xsk_umem__get_data(umem_area, copy_addr), xsk_umem__get_data(umem_area, addr), packet_len);
+        size_t header_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + TS_OPT_SIZE;
+        char *copy = static_cast<char *>(xsk_umem__get_data(umem_area, copy_addr));
+        char *original = static_cast<char *>(xsk_umem__get_data(umem_area, addr));
+        memcpy(copy, original, header_len);
+        memcpy(copy + header_len, original + header_len + offset, plen);
         addr = copy_addr;
         tcp_track_frame(tctx, addr, true);
         tcp_txmeta_clear_all(umem_area, addr);
@@ -923,7 +954,7 @@ static void tcp_ebpf_sync(struct app_ctx_per_thread *tctx)
 
         if (xsk_ring_prod__reserve(tx, 1, &idx_tx) < 1)
         {
-            fprintf(stdout, "#%u(idx:%u) Tx Ring is busy\n", conn->qid, qidx);
+            kick_tx(tctx->txrx_xsk_fd[qidx], tx);
             break;
         }
 
@@ -985,8 +1016,14 @@ static inline void tcp_retransmission(struct app_ctx_per_thread *tctx)
         struct eTrantcp_connection *conn = it->first;
         uint32_t len = it->second;
 
-        if (!conn->unack_tx_addrs.empty()) 
-            eTran_tcp_tx_submit_zc_retransmission(tctx, conn, len);
+        if (!conn->unack_tx_addrs.empty()) {
+            int submitted = eTran_tcp_tx_submit_zc_retransmission(tctx, conn, len);
+            if (submitted >= 0 && static_cast<uint32_t>(submitted) < len) {
+                it->second -= submitted;
+                ++it;
+                continue;
+            }
+        }
 
         // printf("Retransmitting %u bytes for conn (%p)\n", len, conn);
 
@@ -1002,10 +1039,17 @@ static inline void tcp_free_buffers(struct app_ctx_per_thread *tctx)
         struct eTrantcp_connection *conn = *it;
         while (conn->pending_free_bytes) {
             auto [addr, plen] = conn->unack_tx_addrs.front();
+            uint32_t remaining = plen - conn->acked_frame_offset;
+            if (conn->pending_free_bytes < remaining) {
+                conn->acked_frame_offset += conn->pending_free_bytes;
+                conn->pending_free_bytes = 0;
+                break;
+            }
+            conn->acked_frame_offset = 0;
             conn->unack_tx_addrs.pop_front();
             bool tracked = tcp_release_frame(tctx, addr, TCP_FRAME_ACKED);
             assert(tracked);
-            conn->pending_free_bytes -= plen;
+            conn->pending_free_bytes -= remaining;
         }
         tctx->free_pending_conns.erase(it);
     }

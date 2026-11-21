@@ -692,20 +692,20 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
 
     TCP_LOCK(c);
 
-    /* A window reopening must reach the sender even during recovery, when
-     * an ACK may refer to bytes queued for retransmission. */
     __u32 remote_window = (__u32)bpf_ntohs(tcph->window) << TCP_WND_SCALE;
-    bool window_reopened = remote_window > c->rx_remote_avail;
-    if (window_reopened)
-        c->rx_remote_avail = remote_window;
+    bool window_changed = remote_window != c->rx_remote_avail;
 
     /* ACK processing */
     if (tcph->ack == 1) {
         // update CC
         cc->cnt_rx_acks++;
         if (likely(tcp_valid_rxack(c, ack_seq, &tx_bump)) == 0) {
-            /* Window updates do not depend on accepting the ACK packet sequence. */
-            c->rx_remote_avail = remote_window;
+            /* Ignore window advertisements outside the receive sequence window. */
+            bool window_seq_valid = c->rx_avail ?
+                seq_in_range(seq, c->rx_next_seq, c->rx_next_seq + c->rx_avail, false) :
+                seq == c->rx_next_seq;
+            if (window_seq_valid)
+                c->rx_remote_avail = remote_window;
             if (unlikely(tx_bump > c->tx_sent)) {
                 tx_bump = 0;
                 /* Validate payload independently of a stale ACK during recovery. */
@@ -729,7 +729,7 @@ static __always_inline int tcp_rx_process(struct tcphdr *tcph, struct bpf_tcp_co
             * 4. There is no window update: c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)
             */
             /* duplicate ack ? */
-            else if (unlikely(c->tx_sent && !window_reopened && payload_len == 0 && (c->rx_remote_avail == ((bpf_ntohs(tcph->window)) << TCP_WND_SCALE)) && ++c->rx_dupack_cnt == 3)) {
+            else if (unlikely(c->tx_sent && window_seq_valid && !window_changed && payload_len == 0 && ++c->rx_dupack_cnt == 3)) {
                 go_back_pos = fast_retransmit(c, cc);
                 retransmit = true; // ring position zero is a valid recovery target
                 xdp_log("Duplicate ACK triggers fast retransmission");
